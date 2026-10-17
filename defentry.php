@@ -2,7 +2,7 @@
 /*
 Plugin Name: Defentry - Smart Security & Login Protection
 Description: Defentry is a lightweight WordPress device-based login protection plugin. When an admin, editor or author logs in from a new device, a verification overlay blocks the dashboard until a stop password is entered, while other users get a real-time alert banner. Includes master admin control, trusted device management, IP attempt limiting and email alerts.
-Version: 1.2.3
+Version: 2.0.5
 Author: Md Jahid Bin Sabit
 Author URI: https://jbsabit.com
 License: GPLv2 or later
@@ -48,6 +48,9 @@ class SCBR_Security_Control_Master {
             add_action('wp_ajax_scbr_trust_device', [$this, 'ajax_trust_device']);
             add_action('wp_ajax_scbr_remove_device', [$this, 'ajax_remove_device']);
             add_action('wp_ajax_scbr_mute_siren', [$this, 'ajax_mute_siren']);
+            add_action('wp_ajax_scbr_check_broadcast', [$this, 'ajax_check_broadcast']);
+            add_action('wp_ajax_scbr_block_ip', [$this, 'ajax_block_ip']);
+            add_action('wp_ajax_scbr_unmute_siren', [$this, 'ajax_unmute_siren']);
 
             // Security headers (was dead code — now actually hooked).
             add_action('send_headers', [$this, 'set_security_headers']);
@@ -58,6 +61,9 @@ class SCBR_Security_Control_Master {
             add_action('admin_post_scbr_set_master', [$this, 'handle_set_master_admin']);
             add_action('admin_post_scbr_save_settings', [$this, 'handle_save_settings']);
             add_action('admin_post_scbr_trust_reset', [$this, 'handle_trust_reset']);
+
+            // Dashboard widget (read-only security overview).
+            add_action('wp_dashboard_setup', [$this, 'register_dashboard_widget']);
         } catch (Exception $e) {
             // Log error silently - don't show admin notice to avoid annoying users
         }
@@ -216,6 +222,7 @@ class SCBR_Security_Control_Master {
             'token' => $token,
             'user'  => $by_user_id,
             'device_id' => $device_id,
+            'ip'    => $this->ip_address(),
             'time'  => time(),
         ], 15 * MINUTE_IN_SECONDS);
     }
@@ -296,17 +303,19 @@ class SCBR_Security_Control_Master {
         $user_id = get_current_user_id();
         $device_id = $this->current_device_id();
 
-        // Enqueue styles for relevant admin pages
-        if ($opts['status'] === 'on' && (
-            $hook === 'toplevel_page_scbr_settings' ||
-            get_transient($this->transient_prefix . $user_id . '_' . $device_id) ||
-            get_transient($this->transient_broadcast)
-        )) {
+        // Enqueue styles for relevant admin pages. The settings page and the
+        // dashboard widget always need the v2 styles, even when protection is
+        // off; when protection is on, every admin page needs them (broadcast
+        // banner, overlay, realtime alerts).
+        if ($hook === 'toplevel_page_scbr_settings' ||
+            $hook === 'dashboard' ||
+            $opts['status'] === 'on'
+        ) {
             wp_enqueue_style(
                 'scbr-admin',
                 plugin_dir_url(__FILE__) . 'css/scbr-admin.css',
                 [],
-                '1.2.3'
+                '2.0.5'
             );
         }
 
@@ -319,7 +328,7 @@ class SCBR_Security_Control_Master {
                 'scbr-overlay',
                 plugin_dir_url(__FILE__) . 'js/scbr-overlay.js',
                 [],
-                '1.2.3',
+                '2.0.5',
                 true
             );
             wp_localize_script('scbr-overlay', 'scbr_ajax', [
@@ -328,14 +337,16 @@ class SCBR_Security_Control_Master {
             ]);
         }
 
-        // Enqueue settings script for settings page
-        if ($hook === 'toplevel_page_scbr_settings') {
+        // Enqueue settings script. Banner action buttons (trust/block/mute)
+        // render on every admin page via admin_notices, so their handlers must
+        // be present globally whenever protection is on (delegated binding).
+        if ($hook === 'toplevel_page_scbr_settings' || $opts['status'] === 'on') {
             wp_enqueue_media();
             wp_enqueue_script(
                 'scbr-settings',
                 plugin_dir_url(__FILE__) . 'js/scbr-settings.js',
                 ['jquery', 'wp-mediaelement'],
-                '1.2.3',
+                '2.0.5',
                 true
             );
             wp_localize_script('scbr-settings', 'scbr_ajax', [
@@ -349,9 +360,25 @@ class SCBR_Security_Control_Master {
                 'scbr-broadcast',
                 plugin_dir_url(__FILE__) . 'js/scbr-broadcast.js',
                 [],
-                '1.2.3',
+                '2.0.5',
                 true
             );
+        }
+
+        // Realtime broadcast poller: lets other logged-in admins see and hear
+        // a new-device alert without reloading the page.
+        if ($opts['status'] === 'on' && !empty($opts['features']['broadcast_siren']) && current_user_can('edit_posts')) {
+            wp_enqueue_script(
+                'scbr-broadcast-poll',
+                plugin_dir_url(__FILE__) . 'js/scbr-broadcast-poll.js',
+                [],
+                '2.0.5',
+                true
+            );
+            wp_localize_script('scbr-broadcast-poll', 'scbrPoll', [
+                'ajaxurl' => admin_url('admin-ajax.php'),
+                'nonce'   => wp_create_nonce($this->nonce_action),
+            ]);
         }
 
         // Enqueue inline style for scroll blocking
@@ -459,21 +486,34 @@ class SCBR_Security_Control_Master {
     public function render_new_device_overlay() {
         $opts = $this->get_opts();
         $message = esc_html($opts['overlay_text'] ?? 'Security Verification: Enter Siren Stop Password.');
+        $siren_muted = (bool) get_user_meta(get_current_user_id(), 'scbr_siren_muted', true);
 
         $audio_src = !empty($opts['custom_audio_url']) ? esc_url($opts['custom_audio_url']) : 'data:audio/mpeg;base64,' . $this->base64_siren();
         $audio_type = !empty($opts['custom_audio_url']) ? esc_attr('audio/mpeg') : esc_attr('audio/mpeg');
         ?>
         <div id="scbr-overlay">
             <div class="scbr-overlay-bg"></div>
-            <div role="dialog" aria-modal="true" aria-labelledby="scbr-title" class="scbr-dialog">
-                <h2 id="scbr-title">Security Verification</h2>
-                <p><?php echo esc_html($message); ?></p>
+            <div class="scbr2-overlay-center">
+                <div role="dialog" aria-modal="true" aria-labelledby="scbr-title" class="scbr-dialog scbr2-dialog">
+                    <div class="scbr2-dialog-shield" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-3.6 8-10V5l-8-3-8 3v7c0 6.4 8 10 8 10z"/><path d="M9 11.5l2 2 4-4.5"/></svg>
+                    </div>
+                    <h2 id="scbr-title"><?php esc_html_e('Security Verification', 'defentry'); ?></h2>
+                    <p class="scbr2-dialog-sub"><?php echo esc_html($message); ?></p>
 
-                <div class="scbr-input-group">
-                    <input type="password" id="scbr-pass" placeholder="Siren Stop Password" autocomplete="off">
-                    <button id="scbr-submit" class="button button-primary">Verify & Continue</button>
+                    <div class="scbr-input-group">
+                        <label class="screen-reader-text" for="scbr-pass"><?php esc_html_e('Siren Stop Password', 'defentry'); ?></label>
+                        <input type="password" id="scbr-pass" placeholder="<?php esc_attr_e('Siren Stop Password', 'defentry'); ?>" autocomplete="off">
+                        <button id="scbr-submit" class="button button-primary scbr2-verify-btn"><?php esc_html_e('Verify & Continue', 'defentry'); ?></button>
+                    </div>
+                    <div id="scbr-feedback" role="alert" aria-live="polite"></div>
+                    <p class="scbr2-dialog-hint"><?php esc_html_e('This device is not recognized. Verification is required before you can continue.', 'defentry'); ?></p>
+                    <p class="scbr2-dialog-sound">
+                        <button type="button" id="scbr-sound-toggle" class="scbr2-link-btn" data-muted="<?php echo $siren_muted ? '1' : '0'; ?>" data-label-on="<?php esc_attr_e('Turn siren sound on', 'defentry'); ?>" data-label-off="<?php esc_attr_e('Turn siren sound off', 'defentry'); ?>" title="<?php esc_attr_e('Mute or unmute the siren on your browsers', 'defentry'); ?>">
+                            <?php echo $siren_muted ? esc_html__('Turn siren sound on', 'defentry') : esc_html__('Turn siren sound off', 'defentry'); ?>
+                        </button>
+                    </p>
                 </div>
-                <div id="scbr-feedback"></div>
             </div>
 
             <?php if (!empty($opts['features']['siren_enabled'])): ?>
@@ -498,24 +538,32 @@ class SCBR_Security_Control_Master {
         $this->admin_header_siren();
     }
 
-    public function admin_header_siren() {
-        if (!current_user_can('edit_posts')) return;
+    /**
+     * Siren audio source for the broadcast alert, or '' when it must not play
+     * (feature off, no active alert, user muted, or insufficient caps).
+     */
+    private function get_broadcast_audio_src() {
+        if (!current_user_can('edit_posts')) return '';
         $opts = $this->get_opts();
-        if (empty($opts['features']['broadcast_siren'])) return;
+        if (empty($opts['features']['broadcast_siren'])) return '';
 
-        $broadcast = get_transient($this->transient_broadcast);
-        if (!$broadcast) return;
+        if (!get_transient($this->transient_broadcast)) return '';
 
         $muted = get_user_meta(get_current_user_id(), 'scbr_siren_muted', true);
-        if ($muted) return;
+        if ($muted) return '';
 
-        $audio_src = !empty($opts['custom_audio_url']) ? esc_url($opts['custom_audio_url']) : 'data:audio/mpeg;base64,' . $this->base64_siren();
-        $audio_type = !empty($opts['custom_audio_url']) ? esc_attr('audio/mpeg') : esc_attr('audio/mpeg');
+        $opts = $this->get_opts();
+        return !empty($opts['custom_audio_url']) ? esc_url($opts['custom_audio_url']) : 'data:audio/mpeg;base64,' . $this->base64_siren();
+    }
+
+    public function admin_header_siren() {
+        $audio_src = $this->get_broadcast_audio_src();
+        if (!$audio_src) return;
 
         // Output audio tag
         ?>
         <audio id="scbr-broadcast" style="display:none" loop>
-            <source src="<?php echo esc_url($audio_src); ?>" type="<?php echo esc_attr($audio_type); ?>">
+            <source src="<?php echo esc_url($audio_src); ?>" type="audio/mpeg">
         </audio>
         <?php
     }
@@ -552,13 +600,21 @@ class SCBR_Security_Control_Master {
         $is_blocked = $this->is_user_blocked($trigger_user);
         $action = $is_blocked ? 'unblock' : 'block';
         $action_label = $is_blocked ? 'Unblock User' : 'Block User';
+        $siren_muted = (bool) get_user_meta(get_current_user_id(), 'scbr_siren_muted', true);
+        $mute_class = $siren_muted ? 'scbr-unmute' : 'scbr-mute';
+        $mute_label = $siren_muted ? __('Unmute Siren', 'defentry') : __('Mute Siren', 'defentry');
         ?>
-        <div class="notice notice-error is-dismissible scbr-broadcast-notice">
+        <div class="notice notice-error is-dismissible scbr-broadcast-notice scbr2-banner" data-scbr-token="<?php echo esc_attr($broadcast['token'] ?? ''); ?>">
+            <span class="scbr2-banner-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg></span>
+            <div class="scbr2-banner-body">
             <?php if ($is_same_user): ?>
                 <p><strong>ALERT:</strong> New device login detected for your account (Device ID: <?php echo esc_html($broadcast['device_id'] ?? ''); ?>). Trust the device or contact the master admin to protect the website.</p>
                 <p>
                     <button class="button button-primary scbr-action" data-action="trust" data-user-id="<?php echo esc_attr($trigger_user); ?>" data-device-id="<?php echo esc_attr($broadcast['device_id'] ?? ''); ?>" data-nonce="<?php echo esc_attr($nonce); ?>">Trust Device</button>
-                    <button class="button scbr-mute" data-nonce="<?php echo esc_attr($nonce); ?>">Mute Siren</button>
+                    <button class="button <?php echo esc_attr($mute_class); ?>" data-nonce="<?php echo esc_attr($nonce); ?>"><?php echo esc_html($mute_label); ?></button>
+                    <?php if ($this->is_master_admin() && !$is_trigger_device): ?>
+                    <button class="button scbr-block-ip" data-nonce="<?php echo esc_attr($nonce); ?>" title="<?php esc_attr_e('Instantly block the IP of the new device for 1 hour', 'defentry'); ?>">Block IP</button>
+                    <?php endif; ?>
                 </p>
             <?php else: ?>
                 <p><strong>ALERT:</strong> New device login detected for <code><?php echo esc_html($name); ?></code> (ID: <?php echo esc_attr($trigger_user); ?>). Siren active until verified or action taken.</p>
@@ -567,9 +623,10 @@ class SCBR_Security_Control_Master {
                         <button class="button button-primary scbr-action" data-action="<?php echo esc_attr($action); ?>" data-user-id="<?php echo esc_attr($trigger_user); ?>" data-nonce="<?php echo esc_attr($nonce); ?>"><?php echo esc_html($action_label); ?></button>
                         <button class="button scbr-action" data-action="trust" data-user-id="<?php echo esc_attr($trigger_user); ?>" data-device-id="<?php echo esc_attr($broadcast['device_id'] ?? ''); ?>" data-nonce="<?php echo esc_attr($nonce); ?>">Trust Device</button>
                     <?php endif; ?>
-                    <button class="button scbr-mute" data-nonce="<?php echo esc_attr($nonce); ?>">Mute Siren</button>
+                    <button class="button <?php echo esc_attr($mute_class); ?>" data-nonce="<?php echo esc_attr($nonce); ?>"><?php echo esc_html($mute_label); ?></button>
                 </p>
             <?php endif; ?>
+            </div><!-- .scbr2-banner-body -->
         </div>
         <?php
     }
@@ -632,6 +689,18 @@ class SCBR_Security_Control_Master {
         $sessions = WP_Session_Tokens::get_instance($target_user_id);
         $sessions->destroy_all();
         delete_user_meta($target_user_id, 'scbr_trusted_devices');
+
+        // Instantly block the IP tied to the active new-device alert for this
+        // user, so the suspicious device is locked out immediately.
+        $broadcast = get_transient($this->transient_broadcast);
+        if (!empty($broadcast['ip'])
+            && intval($broadcast['user'] ?? 0) === $target_user_id
+            && filter_var($broadcast['ip'], FILTER_VALIDATE_IP)
+        ) {
+            set_transient($this->ip_blocked_prefix . $broadcast['ip'], 1, HOUR_IN_SECONDS);
+            delete_transient($this->ip_attempts_prefix . $broadcast['ip']);
+        }
+
         delete_transient($this->transient_broadcast);
 
         $opts = $this->get_opts();
@@ -795,6 +864,78 @@ class SCBR_Security_Control_Master {
         wp_send_json_success(['ok' => 1]);
     }
 
+    /**
+     * Realtime broadcast check for the admin poller. Returns the rendered
+     * warning banner HTML plus the siren audio source so other logged-in
+     * admins see and hear a new-device alert without reloading the page.
+     */
+    public function ajax_check_broadcast() {
+        if (!is_user_logged_in() || !current_user_can('edit_posts')) {
+            wp_send_json_error('Not allowed.', 403);
+        }
+
+        check_ajax_referer($this->nonce_action, 'nonce');
+
+        $opts = $this->get_opts();
+        if (empty($opts['status']) || $opts['status'] !== 'on' || empty($opts['features']['broadcast_siren'])) {
+            wp_send_json_success(['active' => false]);
+        }
+
+        $broadcast = get_transient($this->transient_broadcast);
+        if (!$broadcast) {
+            wp_send_json_success(['active' => false]);
+        }
+
+        ob_start();
+        $this->render_broadcast_banner();
+        $html = ob_get_clean();
+
+        wp_send_json_success([
+            'active'    => true,
+            'token'     => $broadcast['token'] ?? '',
+            'html'      => $html,
+            'audio_src' => $this->get_broadcast_audio_src(),
+        ]);
+    }
+
+    /**
+     * Instantly block the IP tied to the active new-device alert.
+     * Master Admin only. Used by the "Block IP" banner button.
+     */
+    public function ajax_block_ip() {
+        if (!is_user_logged_in() || !$this->is_master_admin()) {
+            wp_send_json_error('Not allowed. Only Master Admin can block IPs.', 403);
+        }
+
+        check_ajax_referer($this->nonce_action, 'nonce');
+
+        $broadcast = get_transient($this->transient_broadcast);
+        $ip = $broadcast['ip'] ?? '';
+        if (!$ip || !filter_var($ip, FILTER_VALIDATE_IP)) {
+            wp_send_json_error('No active alert IP to block.', 400);
+        }
+
+        set_transient($this->ip_blocked_prefix . $ip, 1, HOUR_IN_SECONDS);
+        delete_transient($this->ip_attempts_prefix . $ip);
+
+        wp_send_json_success(['ok' => 1, 'ip' => $ip]);
+    }
+
+    /**
+     * Re-enable the broadcast siren after it was muted. Any user who could
+     * mute it can unmute it.
+     */
+    public function ajax_unmute_siren() {
+        if (!is_user_logged_in() || !current_user_can('edit_posts')) {
+            wp_send_json_error('Not allowed.', 403);
+        }
+
+        check_ajax_referer($this->nonce_action, 'nonce');
+
+        delete_user_meta(get_current_user_id(), 'scbr_siren_muted');
+        wp_send_json_success(['ok' => 1]);
+    }
+
     /* ------------------------------ Settings UI ------------------------------ */
 
     public function register_settings_page() {
@@ -807,138 +948,517 @@ class SCBR_Security_Control_Master {
             'dashicons-shield',
             65
         );
+        // The control plane is Master-Admin-exclusive: once setup is done,
+        // secondary admins don't even see the menu. (First-run wizard stays
+        // open to all admins; direct URL access still hits the wp_die guard.)
+        $opts = $this->get_opts();
+        if (empty($opts['needs_master_admin']) && !$this->is_master_admin()) {
+            remove_menu_page('scbr_settings');
+        }
     }
 
     public function render_settings_page() {
-        if (!$this->is_master_admin()) {
+        $opts = $this->get_opts();
+        $needs_setup = !empty($opts['needs_master_admin']);
+
+        // First run: any administrator may open the setup wizard (the same
+        // audience the existing admin-notice form already serves). Once a
+        // Master Admin exists, only they may open these settings.
+        if ($needs_setup) {
+            if (!current_user_can('manage_options')) {
+                wp_die(esc_html(__('Only an administrator can set up Defentry.', 'defentry')));
+            }
+        } elseif (!$this->is_master_admin()) {
             wp_die(esc_html(__('Only the Master Admin can access Defentry settings.', 'defentry')));
         }
-        $opts = $this->get_opts();
-        $nonce = wp_create_nonce($this->nonce_action);
 
+        $nonce = wp_create_nonce($this->nonce_action);
         wp_enqueue_media();
+
+        // First-run setup wizard.
+        if ($needs_setup) {
+            $this->render_setup_wizard($nonce);
+            return;
+        }
+        // Wizard steps 2-3, shown right after step 1 was saved.
+        // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only render-path switch; state changes happen in nonce-verified admin_post handlers.
+        if (isset($_GET['scbr_wizard'])) {
+            $this->render_setup_wizard_steps_23($opts, $nonce);
+            return;
+        }
+
+        $tabs = [
+            'overview'     => __('Overview', 'defentry'),
+            'verification' => __('Verification', 'defentry'),
+            'devices'      => __('Devices', 'defentry'),
+            'protection'   => __('Protection', 'defentry'),
+            'master'       => __('Master Admin', 'defentry'),
+        ];
+        // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only tab switch; value is sanitized with sanitize_key() and whitelisted against $tabs.
+        $tab = isset($_GET['scbr_tab']) ? sanitize_key(wp_unslash($_GET['scbr_tab'])) : 'overview';
+        if (!isset($tabs[$tab])) {
+            $tab = 'overview';
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only success notice; the save itself is nonce-verified in handle_save_settings().
+        if (isset($_GET['updated'])) {
+            echo '<div class="notice notice-success is-dismissible"><p>' . esc_html(__('Defentry settings saved.', 'defentry')) . '</p></div>';
+        }
+        // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only success notice; the reset itself is nonce-verified in handle_trust_reset().
+        if (isset($_GET['reset'])) {
+            echo '<div class="notice notice-success is-dismissible"><p>' . esc_html(__('Trusted devices have been reset.', 'defentry')) . '</p></div>';
+        }
         ?>
-        <div class="wrap">
-            <h1>Defentry — Master Control Panel</h1>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data">
+        <div class="wrap scbr2-wrap">
+            <h1 class="scbr2-title"><span class="dashicons dashicons-shield scbr2-title-icon"></span> <?php esc_html_e('Defentry — Master Control Panel', 'defentry'); ?></h1>
+
+            <h2 class="nav-tab-wrapper scbr2-tabs">
+                <?php foreach ($tabs as $id => $label): ?>
+                    <a href="<?php echo esc_url(add_query_arg('scbr_tab', $id)); ?>"
+                       class="nav-tab <?php echo $tab === $id ? 'nav-tab-active' : ''; ?>"
+                       data-scbr-tab="<?php echo esc_attr($id); ?>"><?php echo esc_html($label); ?></a>
+                <?php endforeach; ?>
+            </h2>
+
+            <div class="scbr2-panels">
+                <div class="scbr2-panel" data-scbr-panel="overview" <?php echo $tab !== 'overview' ? 'hidden' : ''; ?>>
+                    <?php $this->render_overview_tab($opts, $nonce); ?>
+                </div>
+                <div class="scbr2-panel" data-scbr-panel="verification" <?php echo $tab !== 'verification' ? 'hidden' : ''; ?>>
+                    <?php $this->render_verification_tab($opts, $nonce); ?>
+                </div>
+                <div class="scbr2-panel" data-scbr-panel="devices" <?php echo $tab !== 'devices' ? 'hidden' : ''; ?>>
+                    <?php $this->render_devices_tab($nonce); ?>
+                </div>
+                <div class="scbr2-panel" data-scbr-panel="protection" <?php echo $tab !== 'protection' ? 'hidden' : ''; ?>>
+                    <?php $this->render_protection_tab($nonce); ?>
+                </div>
+                <div class="scbr2-panel" data-scbr-panel="master" <?php echo $tab !== 'master' ? 'hidden' : ''; ?>>
+                    <?php $this->render_master_tab($opts, $nonce); ?>
+                </div>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Total trusted devices across all monitored users.
+     * Presentation helper only — reads existing user meta.
+     */
+    private function count_trusted_devices() {
+        $total = 0;
+        foreach ($this->admins_list() as $u) {
+            $total += count($this->trusted_devices($u->ID));
+        }
+        return $total;
+    }
+
+    /**
+     * Hidden fields that carry the current feature flags and siren audio URL
+     * through partial settings forms (Overview toggle, Master Admin tab,
+     * setup wizard). Without them, saving a partial form would reset the
+     * untouched settings to their defaults. Presentation only.
+     */
+    private function render_passthrough_fields($opts) {
+        $features = $opts['features'] ?? [];
+        foreach (['siren_enabled', 'email_alerts', 'overlay_enabled', 'broadcast_siren'] as $key) {
+            printf(
+                '<input type="hidden" name="features[%s]" value="%d">' . "\n",
+                esc_attr($key),
+                !empty($features[$key]) ? 1 : 0
+            );
+        }
+        printf(
+            '<input type="hidden" name="custom_audio_url" value="%s">' . "\n",
+            esc_attr($opts['custom_audio_url'] ?? '')
+        );
+    }
+
+    private function render_overview_tab($opts, $nonce) {
+        $is_on = !empty($opts['status']) && $opts['status'] === 'on';
+        $trusted_total = $this->count_trusted_devices();
+        $blocked_total = count(get_option($this->blocked_users_key, []));
+        ?>
+        <div class="scbr2-card scbr2-status-card">
+            <div class="scbr2-status-main">
+                <span class="scbr2-pill <?php echo $is_on ? 'scbr2-pill-on' : 'scbr2-pill-off'; ?>">
+                    <?php echo $is_on ? esc_html__('Protection ON', 'defentry') : esc_html__('Protection OFF', 'defentry'); ?>
+                </span>
+                <p class="scbr2-muted">
+                    <?php
+                    echo $is_on
+                        ? esc_html__('New-device verification, siren alerts, and IP attempt limiting are active.', 'defentry')
+                        : esc_html__('Defentry is not monitoring logins. Turn protection on to activate verification.', 'defentry');
+                    ?>
+                </p>
+            </div>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="scbr2-status-form">
                 <input type="hidden" name="action" value="scbr_save_settings">
                 <input type="hidden" name="nonce" value="<?php echo esc_attr($nonce); ?>">
+                <?php $this->render_passthrough_fields($opts); ?>
+                <label class="scbr2-switch" title="<?php esc_attr_e('Toggle protection', 'defentry'); ?>">
+                    <input type="checkbox" name="status" value="on" <?php checked($is_on); ?>>
+                    <span class="scbr2-slider" aria-hidden="true"></span>
+                    <span class="screen-reader-text"><?php esc_html_e('Protection status', 'defentry'); ?></span>
+                </label>
+                <?php submit_button(__('Save', 'defentry'), 'primary', 'submit', false); ?>
+            </form>
+        </div>
 
-                <table class="form-table" role="presentation">
-                    <tr>
-                        <th scope="row">Status</th>
-                        <td>
-                            <label><input type="radio" name="status" value="on" <?php checked(!empty($opts['status']) && $opts['status'] === 'on'); ?>> ON</label>
-                            &nbsp;&nbsp;
-                            <label><input type="radio" name="status" value="off" <?php checked(empty($opts['status']) || $opts['status'] === 'off'); ?>> OFF</label>
-                            <p class="description">When OFF the plugin does not monitor logins or trigger siren. Only Master Admin can toggle.</p>
-                        </td>
-                    </tr>
+        <div class="scbr2-tiles">
+            <div class="scbr2-tile">
+                <span class="scbr2-tile-num"><?php echo esc_html(number_format_i18n($trusted_total)); ?></span>
+                <span class="scbr2-tile-label"><?php esc_html_e('Trusted devices', 'defentry'); ?></span>
+                <a class="scbr2-tile-link" href="<?php echo esc_url(add_query_arg('scbr_tab', 'devices')); ?>" data-scbr-tab="devices"><?php esc_html_e('Manage →', 'defentry'); ?></a>
+            </div>
+            <div class="scbr2-tile">
+                <span class="scbr2-tile-num"><?php echo esc_html(number_format_i18n($blocked_total)); ?></span>
+                <span class="scbr2-tile-label"><?php esc_html_e('Blocked users', 'defentry'); ?></span>
+                <a class="scbr2-tile-link" href="<?php echo esc_url(add_query_arg('scbr_tab', 'protection')); ?>" data-scbr-tab="protection"><?php esc_html_e('Manage →', 'defentry'); ?></a>
+            </div>
+            <div class="scbr2-tile">
+                <span class="scbr2-tile-num">3</span>
+                <span class="scbr2-tile-label"><?php esc_html_e('Failed attempts before IP block', 'defentry'); ?></span>
+                <a class="scbr2-tile-link" href="<?php echo esc_url(add_query_arg('scbr_tab', 'protection')); ?>" data-scbr-tab="protection"><?php esc_html_e('Details →', 'defentry'); ?></a>
+            </div>
+        </div>
+        <?php
+    }
 
-                    <tr>
-                        <th scope="row"><label for="siren_password">Siren Stop Password</label></th>
-                        <td>
-                            <input name="siren_password" id="siren_password" type="password" class="regular-text" value="" placeholder="Leave blank to keep the current password" autocomplete="new-password" />
-                            <p class="description">For security the current password is never shown. Enter a new one only to change it.</p>
-                        </td>
-                    </tr>
+    private function render_verification_tab($opts, $nonce) {
+        $features = $opts['features'] ?? [];
+        $feature_defs = [
+            'siren_enabled'   => [__('Enable Siren Sound', 'defentry'), __('Play the siren when a new device needs verification.', 'defentry')],
+            'overlay_enabled' => [__('Full-Screen Overlay', 'defentry'), __('Block the screen with the red verification prompt on new devices.', 'defentry')],
+            'broadcast_siren' => [__('Siren for Other Admins', 'defentry'), __('Other logged-in admins hear the siren and see the blinking alert banner.', 'defentry')],
+            'email_alerts'    => [__('Email Alerts', 'defentry'), __('Notify other admins by email about new device logins.', 'defentry')],
+        ];
+        ?>
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data" class="scbr2-form">
+            <input type="hidden" name="action" value="scbr_save_settings">
+            <input type="hidden" name="nonce" value="<?php echo esc_attr($nonce); ?>">
 
-                    <tr>
-                        <th scope="row"><label for="custom_audio">Custom Siren Audio</label></th>
-                        <td>
-                            <input type="text" name="custom_audio_url" id="custom_audio_url" class="regular-text" value="<?php echo esc_attr($opts['custom_audio_url'] ?? ''); ?>" readonly />
-                            <input type="button" class="button" id="upload_audio_button" value="Upload Audio" />
-                            <p class="description">Upload an MP3 file for the siren sound. Leave empty to use the default siren.</p>
-                            <?php if (!empty($opts['custom_audio_url'])): ?>
-                                <p><a href="<?php echo esc_url($opts['custom_audio_url']); ?>" target="_blank">Listen to current audio</a> | <a href="#" id="clear_audio">Clear custom audio</a></p>
-                            <?php endif; ?>
-                        </td>
-                    </tr>
+            <div class="scbr2-card">
+                <h2><span class="dashicons dashicons-lock"></span><?php esc_html_e('Siren Stop Password', 'defentry'); ?></h2>
+                <div class="scbr2-field">
+                    <label class="scbr2-label" for="siren_password"><?php esc_html_e('New stop password', 'defentry'); ?></label>
+                    <input name="siren_password" id="siren_password" type="password" class="regular-text" value="" placeholder="<?php esc_attr_e('Leave blank to keep the current password', 'defentry'); ?>" autocomplete="new-password" />
+                    <p class="scbr2-hint"><?php esc_html_e('For security the current password is never shown. Enter a new one only to change it.', 'defentry'); ?></p>
+                </div>
+                <div class="scbr2-field">
+                    <label class="scbr2-label" for="overlay_text"><?php esc_html_e('Overlay message', 'defentry'); ?></label>
+                    <input name="overlay_text" id="overlay_text" type="text" class="regular-text" value="<?php echo esc_attr($opts['overlay_text'] ?? ''); ?>">
+                </div>
+            </div>
 
-                    <tr><th>Features</th><td>
-                        <label><input type="checkbox" name="features[siren_enabled]" value="1" <?php checked(!empty($opts['features']['siren_enabled'])); ?>> Enable Siren Sound</label><br>
-                        <label><input type="checkbox" name="features[overlay_enabled]" value="1" <?php checked(!empty($opts['features']['overlay_enabled'])); ?>> Full-Screen Overlay on New Device</label><br>
-                        <label><input type="checkbox" name="features[broadcast_siren]" value="1" <?php checked(!empty($opts['features']['broadcast_siren'])); ?>> Siren for Other Users</label><br>
-                        <label><input type="checkbox" name="features[email_alerts]" value="1" <?php checked(!empty($opts['features']['email_alerts'])); ?>> Email Alerts to Other Users</label>
-                    </td></tr>
+            <div class="scbr2-card">
+                <h2><span class="dashicons dashicons-megaphone"></span><?php esc_html_e('Siren Audio', 'defentry'); ?></h2>
+                <div class="scbr2-field">
+                    <label class="scbr2-label" for="custom_audio_url"><?php esc_html_e('Custom siren sound (MP3)', 'defentry'); ?></label>
+                    <input type="text" name="custom_audio_url" id="custom_audio_url" class="regular-text" value="<?php echo esc_attr($opts['custom_audio_url'] ?? ''); ?>" readonly />
+                    <input type="button" class="button" id="upload_audio_button" value="<?php esc_attr_e('Upload Audio', 'defentry'); ?>" />
+                    <p class="scbr2-hint"><?php esc_html_e('Leave empty to use the default siren.', 'defentry'); ?></p>
+                    <?php if (!empty($opts['custom_audio_url'])): ?>
+                        <p><a href="<?php echo esc_url($opts['custom_audio_url']); ?>" target="_blank" rel="noopener"><?php esc_html_e('Listen to current audio', 'defentry'); ?></a> &middot; <a href="#" id="clear_audio"><?php esc_html_e('Clear custom audio', 'defentry'); ?></a></p>
+                    <?php endif; ?>
+                </div>
+            </div>
 
-                    <tr>
-                        <th scope="row"><label for="overlay_text">Overlay Message</label></th>
-                        <td><input name="overlay_text" id="overlay_text" type="text" class="regular-text" value="<?php echo esc_attr($opts['overlay_text'] ?? ''); ?>"></td>
-                    </tr>
+            <div class="scbr2-card">
+                <h2><span class="dashicons dashicons-bell"></span><?php esc_html_e('Alert Features', 'defentry'); ?></h2>
+                <div class="scbr2-toggle-list">
+                    <?php foreach ($feature_defs as $key => $def): ?>
+                    <div class="scbr2-toggle-row">
+                        <div class="scbr2-toggle-text">
+                            <strong><?php echo esc_html($def[0]); ?></strong>
+                            <span><?php echo esc_html($def[1]); ?></span>
+                        </div>
+                        <label class="scbr2-switch">
+                            <input type="checkbox" name="features[<?php echo esc_attr($key); ?>]" value="1" <?php checked(!empty($features[$key])); ?>>
+                            <span class="scbr2-slider" aria-hidden="true"></span>
+                            <span class="screen-reader-text"><?php echo esc_html($def[0]); ?></span>
+                        </label>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+                <div class="scbr2-card-actions">
+                    <?php submit_button(__('Save Settings', 'defentry'), 'primary', 'submit', false); ?>
+                </div>
+            </div>
+        </form>
+        <?php
+    }
 
-                    <tr>
-                        <th scope="row">Master Admin</th>
-                        <td>
-                            <?php
-                            $current = intval($opts['master_admin_id'] ?? 0);
-                            $admins = get_users(['role' => 'administrator', 'fields' => ['ID', 'user_login', 'user_email']]);
-                            ?>
-                            <select name="master_admin_id">
+    private function render_devices_tab($nonce) {
+        ?>
+        <div class="scbr2-form">
+            <div class="scbr2-card">
+                <h2><span class="dashicons dashicons-smartphone"></span><?php esc_html_e('Trusted Devices', 'defentry'); ?></h2>
+                <p class="scbr2-muted"><?php esc_html_e('Every admin account below lists its trusted devices. Remove any device you no longer recognize.', 'defentry'); ?></p>
+                <?php foreach ($this->admins_list() as $admin):
+                    $devices = $this->trusted_devices($admin->ID);
+                    $is_self = intval($admin->ID) === get_current_user_id();
+                ?>
+                    <div class="scbr2-subcard">
+                        <div class="scbr2-user-head">
+                            <span class="dashicons dashicons-admin-users"></span>
+                            <strong><?php echo esc_html($admin->user_login); ?><?php echo $is_self ? ' ' . esc_html__('(you)', 'defentry') : ''; ?></strong>
+                            <span class="scbr2-count-badge"><?php echo esc_html(number_format_i18n(count($devices))); ?></span>
+                        </div>
+                        <?php if (!empty($devices)): ?>
+                            <?php foreach ($devices as $device_id): ?>
+                            <div class="scbr2-row">
+                                <code><?php echo esc_html($device_id); ?></code>
+                                <button class="button scbr-remove-device" data-user-id="<?php echo esc_attr($admin->ID); ?>" data-device-id="<?php echo esc_attr($device_id); ?>" data-nonce="<?php echo esc_attr($nonce); ?>"><?php esc_html_e('Remove', 'defentry'); ?></button>
+                            </div>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <p class="scbr2-muted"><?php esc_html_e('No trusted devices yet.', 'defentry'); ?></p>
+                        <?php endif; ?>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+
+            <div class="scbr2-card scbr2-danger">
+                <h2><span class="dashicons dashicons-warning"></span><?php esc_html_e('Danger Zone', 'defentry'); ?></h2>
+                <p class="scbr2-muted"><?php esc_html_e('Reset all trusted devices for a user. They will need to verify with the Siren Stop Password on their next visit.', 'defentry'); ?></p>
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="scbr2-inline-form">
+                    <input type="hidden" name="action" value="scbr_trust_reset">
+                    <input type="hidden" name="nonce" value="<?php echo esc_attr($nonce); ?>">
+                    <select name="target_user_id" aria-label="<?php esc_attr_e('User', 'defentry'); ?>">
+                        <?php foreach ($this->admins_list() as $a): ?>
+                            <option value="<?php echo esc_attr($a->ID); ?>"><?php echo esc_html($a->user_login . " (ID {$a->ID})"); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <?php submit_button(__('Reset Trusted Devices', 'defentry'), 'delete', 'submit', false); ?>
+                </form>
+            </div>
+        </div>
+        <?php
+    }
+
+    private function render_protection_tab($nonce) {
+        $blocked_users = get_option($this->blocked_users_key, []);
+        ?>
+        <div class="scbr2-form">
+            <div class="scbr2-card">
+                <h2><span class="dashicons dashicons-dismiss"></span><?php esc_html_e('Blocked Users', 'defentry'); ?></h2>
+                <p class="scbr2-muted"><?php esc_html_e('Blocked users are logged out instantly on their next visit. Unblock them here when the threat is over.', 'defentry'); ?></p>
+                <?php if (!empty($blocked_users)): ?>
+                    <?php foreach ($blocked_users as $user_id):
+                        $user = get_user_by('id', $user_id);
+                        if (!$user) continue;
+                    ?>
+                    <div class="scbr2-row">
+                        <div class="scbr2-user-head" style="margin-bottom:0;">
+                            <span class="dashicons dashicons-admin-users"></span>
+                            <strong><?php echo esc_html($user->user_login); ?></strong>
+                            <span class="scbr2-muted">(ID <?php echo esc_html($user_id); ?>)</span>
+                        </div>
+                        <button class="button scbr-unblock-user" data-user-id="<?php echo esc_attr($user_id); ?>" data-nonce="<?php echo esc_attr($nonce); ?>"><?php esc_html_e('Unblock', 'defentry'); ?></button>
+                    </div>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <div class="scbr2-empty">
+                        <span class="dashicons dashicons-shield-alt"></span>
+                        <p><?php esc_html_e('No users are currently blocked. All clear.', 'defentry'); ?></p>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="scbr2-card">
+                <h2><span class="dashicons dashicons-shield"></span><?php esc_html_e('IP Attempt Limiting', 'defentry'); ?></h2>
+                <div class="scbr2-tiles">
+                    <div class="scbr2-tile">
+                        <span class="scbr2-tile-num"><?php echo esc_html(number_format_i18n($this->max_attempts)); ?></span>
+                        <span class="scbr2-tile-label"><?php esc_html_e('Failed attempts before IP block', 'defentry'); ?></span>
+                    </div>
+                    <div class="scbr2-tile">
+                        <span class="scbr2-tile-num"><?php esc_html_e('1 hour', 'defentry'); ?></span>
+                        <span class="scbr2-tile-label"><?php esc_html_e('IP block duration', 'defentry'); ?></span>
+                    </div>
+                </div>
+                <p class="scbr2-muted"><?php esc_html_e('After too many wrong stop-password attempts from the same IP address, that IP is temporarily blocked. Detection uses REMOTE_ADDR only, so attackers cannot evade it by spoofing forwarded headers.', 'defentry'); ?></p>
+            </div>
+        </div>
+        <?php
+    }
+
+    private function render_master_tab($opts, $nonce) {
+        $current = intval($opts['master_admin_id'] ?? 0);
+        $current_user = $current ? get_user_by('id', $current) : null;
+        $admins = get_users(['role' => 'administrator', 'fields' => ['ID', 'user_login']]);
+        ?>
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="scbr2-form">
+            <input type="hidden" name="action" value="scbr_save_settings">
+            <input type="hidden" name="nonce" value="<?php echo esc_attr($nonce); ?>">
+            <?php $this->render_passthrough_fields($opts); ?>
+            <div class="scbr2-card">
+                <h2><span class="dashicons dashicons-super-admin"></span><?php esc_html_e('Master Admin', 'defentry'); ?></h2>
+                <p class="scbr2-muted"><?php esc_html_e('Only the Master Admin can open these settings, block users or IPs, and trust devices for other users. Other admins are still protected by verification, but cannot change anything.', 'defentry'); ?></p>
+                <?php if ($current_user): ?>
+                <div class="scbr2-current">
+                    <span class="dashicons dashicons-super-admin"></span>
+                    <div>
+                        <strong><?php echo esc_html($current_user->user_login); ?></strong>
+                        <span><?php esc_html_e('Current Master Admin', 'defentry'); ?></span>
+                    </div>
+                </div>
+                <?php endif; ?>
+                <div class="scbr2-field">
+                    <label class="scbr2-label" for="master_admin_id"><?php esc_html_e('Transfer the Master Admin role', 'defentry'); ?></label>
+                    <select name="master_admin_id" id="master_admin_id">
+                        <?php foreach ($admins as $a): ?>
+                            <option value="<?php echo esc_attr($a->ID); ?>" <?php selected($current === intval($a->ID)); ?>>
+                                <?php echo esc_html($a->user_login . " (ID {$a->ID})"); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <p class="scbr2-hint"><?php esc_html_e('The Master Admin must be an Administrator. Transferring takes effect immediately.', 'defentry'); ?></p>
+                </div>
+                <div class="scbr2-card-actions">
+                    <?php submit_button(__('Save Settings', 'defentry'), 'primary', 'submit', false); ?>
+                </div>
+            </div>
+        </form>
+        <?php
+    }
+
+    /* ------------------------- Setup Wizard (first run) ------------------------- */
+
+    private function render_setup_wizard($nonce) {
+        $admins = get_users(['role' => 'administrator', 'fields' => ['ID', 'user_login']]);
+        $current_user = get_current_user_id();
+        $return_url = add_query_arg(['page' => 'scbr_settings', 'scbr_wizard' => 2], admin_url('admin.php'));
+        ?>
+        <div class="wrap scbr2-wrap">
+            <h1 class="scbr2-title"><span class="dashicons dashicons-shield scbr2-title-icon"></span> <?php esc_html_e('Defentry — Setup Wizard', 'defentry'); ?></h1>
+            <div class="scbr2-card scbr2-wizard">
+                <ol class="scbr2-steps">
+                    <li class="scbr2-step is-active"><span class="scbr2-step-n">1</span> <?php esc_html_e('Master Admin', 'defentry'); ?></li>
+                    <li class="scbr2-step"><span class="scbr2-step-n">2</span> <?php esc_html_e('Stop Password', 'defentry'); ?></li>
+                    <li class="scbr2-step"><span class="scbr2-step-n">3</span> <?php esc_html_e('Turn On', 'defentry'); ?></li>
+                </ol>
+                <div class="scbr2-wizard-body">
+                    <h2><?php esc_html_e('Step 1 of 3 — Choose the Master Admin', 'defentry'); ?></h2>
+                    <p class="scbr2-muted"><?php esc_html_e('The Master Admin owns Defentry settings and is the only one who can block users or trust devices for others.', 'defentry'); ?></p>
+                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                        <input type="hidden" name="action" value="scbr_set_master">
+                        <input type="hidden" name="nonce" value="<?php echo esc_attr($nonce); ?>">
+                        <input type="hidden" name="scbr_return" value="<?php echo esc_attr($return_url); ?>">
+                        <p>
+                            <select name="master_admin_id" aria-label="<?php esc_attr_e('Master Admin', 'defentry'); ?>">
                                 <?php foreach ($admins as $a): ?>
-                                    <option value="<?php echo esc_attr($a->ID); ?>" <?php selected($current === intval($a->ID)); ?>>
+                                    <option value="<?php echo esc_attr($a->ID); ?>" <?php selected(intval($current_user) === intval($a->ID)); ?>>
                                         <?php echo esc_html($a->user_login . " (ID {$a->ID})"); ?>
                                     </option>
                                 <?php endforeach; ?>
                             </select>
-                            <p class="description">Only the Master Admin can change these settings.</p>
-                            <p class="description">Note: Master Admin must be an Administrator, not an Editor or Author.</p>
-                        </td>
-                    </tr>
-                </table>
+                        </p>
+                        <p>
+                            <?php submit_button(__('Continue →', 'defentry'), 'primary', 'submit', false); ?>
+                            <a class="scbr2-skip" href="<?php echo esc_url(admin_url('index.php')); ?>"><?php esc_html_e('Skip for now', 'defentry'); ?></a>
+                        </p>
+                    </form>
+                </div>
+            </div>
+        </div>
+        <?php
+    }
 
-                <?php submit_button('Save Settings'); ?>
-            </form>
-
-            <hr />
-
-            <h2>Manage Trusted Devices</h2>
-            <p>Remove trusted devices for any user account or reset all devices.</p>
-            <?php
-            foreach ($this->admins_list() as $admin) {
-                $devices = $this->trusted_devices($admin->ID);
-                if (!empty($devices)) {
-                    echo '<h3>' . esc_html($admin->user_login) . ' (ID ' . esc_attr($admin->ID) . ')</h3>';
-                    echo '<ul>';
-                    foreach ($devices as $device_id) {
-                        echo '<li>Device ID: ' . esc_html($device_id) . ' <button class="button scbr-remove-device" data-user-id="' . esc_attr($admin->ID) . '" data-device-id="' . esc_attr($device_id) . '" data-nonce="' . esc_attr($nonce) . '">Remove</button></li>';
-                    }
-                    echo '</ul>';
-                } else {
-                    echo '<p>No trusted devices for ' . esc_html($admin->user_login) . ' (ID ' . esc_attr($admin->ID) . ').</p>';
-                }
-            }
+    private function render_setup_wizard_steps_23($opts, $nonce) {
+        // Only the newly chosen Master Admin can finish the setup.
+        if (!$this->is_master_admin()) {
+            $mid = intval($opts['master_admin_id'] ?? 0);
+            $mu = $mid ? get_user_by('id', $mid) : null;
+            $who = $mu ? $mu->user_login : __('the Master Admin', 'defentry');
             ?>
-
-            <h2>Manage Blocked Users</h2>
-            <p>Unblock users who have been previously blocked.</p>
+            <div class="wrap scbr2-wrap">
+                <h1 class="scbr2-title"><span class="dashicons dashicons-shield scbr2-title-icon"></span> <?php esc_html_e('Defentry — Setup Wizard', 'defentry'); ?></h1>
+                <div class="scbr2-card">
+                    <h2><?php esc_html_e('Almost done', 'defentry'); ?></h2>
+                    <p><?php echo sprintf(
+                        /* translators: %s: master admin login */
+                        esc_html__('Please ask %s to open the Defentry settings to finish the setup (steps 2 and 3).', 'defentry'),
+                        '<strong>' . esc_html($who) . '</strong>'
+                    ); ?></p>
+                </div>
+            </div>
             <?php
-            $blocked_users = get_option($this->blocked_users_key, []);
-            if (!empty($blocked_users)) {
-                echo '<ul>';
-                foreach ($blocked_users as $user_id) {
-                    $user = get_user_by('id', $user_id);
-                    if ($user) {
-                        echo '<li>User: ' . esc_html($user->user_login) . ' (ID ' . esc_attr($user_id) . ') <button class="button scbr-unblock-user" data-user-id="' . esc_attr($user_id) . '" data-nonce="' . esc_attr($nonce) . '">Unblock</button></li>';
-                    }
-                }
-                echo '</ul>';
-            } else {
-                echo '<p>No users are currently blocked.</p>';
-            }
-            ?>
+            return;
+        }
+        ?>
+        <div class="wrap scbr2-wrap">
+            <h1 class="scbr2-title"><span class="dashicons dashicons-shield scbr2-title-icon"></span> <?php esc_html_e('Defentry — Setup Wizard', 'defentry'); ?></h1>
+            <div class="scbr2-card scbr2-wizard">
+                <ol class="scbr2-steps">
+                    <li class="scbr2-step is-done"><span class="scbr2-step-n">✓</span> <?php esc_html_e('Master Admin', 'defentry'); ?></li>
+                    <li class="scbr2-step is-active" data-scbr-wstep="2"><span class="scbr2-step-n">2</span> <?php esc_html_e('Stop Password', 'defentry'); ?></li>
+                    <li class="scbr2-step" data-scbr-wstep="3"><span class="scbr2-step-n">3</span> <?php esc_html_e('Turn On', 'defentry'); ?></li>
+                </ol>
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" id="scbr2-wizard-form">
+                    <input type="hidden" name="action" value="scbr_save_settings">
+                    <input type="hidden" name="nonce" value="<?php echo esc_attr($nonce); ?>">
+                    <input type="hidden" name="status" value="on">
+                    <?php $this->render_passthrough_fields($opts); ?>
+                    <div class="scbr2-wizard-body" data-scbr-wpane="2">
+                        <h2><?php esc_html_e('Step 2 of 3 — Set the Siren Stop Password', 'defentry'); ?></h2>
+                        <p class="scbr2-muted"><?php esc_html_e('This password stops the siren and verifies new devices. The default (2210) must be changed — pick something only you know.', 'defentry'); ?></p>
+                        <p><input name="siren_password" id="scbr2-wizard-pass" type="password" class="regular-text" value="" autocomplete="new-password" required minlength="4" /></p>
+                        <p><button type="button" class="button button-primary" data-scbr-wnext="3"><?php esc_html_e('Continue →', 'defentry'); ?></button></p>
+                    </div>
+                    <div class="scbr2-wizard-body" data-scbr-wpane="3" hidden>
+                        <h2><?php esc_html_e('Step 3 of 3 — Turn protection ON', 'defentry'); ?></h2>
+                        <p class="scbr2-muted"><?php esc_html_e('Defentry will start verifying new devices immediately: unknown devices face the stop-password overlay and siren, and other users get a real-time alert banner.', 'defentry'); ?></p>
+                        <p>
+                            <button type="button" class="button" data-scbr-wprev="2"><?php esc_html_e('← Back', 'defentry'); ?></button>
+                            <?php submit_button(__('Finish Setup', 'defentry'), 'primary', 'submit', false); ?>
+                        </p>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <?php
+    }
 
-            <h3>Reset All Trusted Devices</h3>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="display:flex;gap:10px;align-items:center">
-                <input type="hidden" name="action" value="scbr_trust_reset">
-                <input type="hidden" name="nonce" value="<?php echo esc_attr($nonce); ?>">
-                <select name="target_user_id">
-                    <?php foreach ($this->admins_list() as $a): ?>
-                        <option value="<?php echo esc_attr($a->ID); ?>"><?php echo esc_html($a->user_login . " (ID {$a->ID})"); ?></option>
-                    <?php endforeach; ?>
-                </select>
-                <?php submit_button('Reset Trusted Devices', 'delete', 'submit', false); ?>
-            </form>
+    /* ------------------------- Dashboard Widget ------------------------- */
+
+    public function register_dashboard_widget() {
+        if (!current_user_can('edit_posts')) {
+            return;
+        }
+        // Dashboard widget is part of the control plane: Master Admin only
+        // once setup is complete.
+        $opts = $this->get_opts();
+        if (empty($opts['needs_master_admin']) && !$this->is_master_admin()) {
+            return;
+        }
+        wp_add_dashboard_widget(
+            'scbr_security_widget',
+            __('Defentry Security', 'defentry'),
+            [$this, 'render_dashboard_widget']
+        );
+    }
+
+    public function render_dashboard_widget() {
+        $opts = $this->get_opts();
+        $is_on = !empty($opts['status']) && $opts['status'] === 'on';
+        $trusted_total = $this->count_trusted_devices();
+        $blocked_total = count(get_option($this->blocked_users_key, []));
+        ?>
+        <div class="scbr2-widget">
+            <p>
+                <span class="scbr2-pill <?php echo $is_on ? 'scbr2-pill-on' : 'scbr2-pill-off'; ?>">
+                    <?php echo $is_on ? esc_html__('Protection ON', 'defentry') : esc_html__('Protection OFF', 'defentry'); ?>
+                </span>
+            </p>
+            <ul class="scbr2-widget-stats">
+                <li><strong><?php echo esc_html(number_format_i18n($trusted_total)); ?></strong> <?php esc_html_e('trusted devices', 'defentry'); ?></li>
+                <li><strong><?php echo esc_html(number_format_i18n($blocked_total)); ?></strong> <?php esc_html_e('blocked users', 'defentry'); ?></li>
+            </ul>
+            <?php if ($this->is_master_admin()): ?>
+                <p><a href="<?php echo esc_url(admin_url('admin.php?page=scbr_settings')); ?>"><?php esc_html_e('Open Defentry settings →', 'defentry'); ?></a></p>
+            <?php endif; ?>
         </div>
         <?php
     }
@@ -950,7 +1470,11 @@ class SCBR_Security_Control_Master {
 
         $opts = $this->get_opts();
 
-        $opts['status'] = isset($_POST['status']) && $_POST['status'] === 'on' ? 'on' : 'off';
+        // Only touch the status when the submitted form manages it (Overview
+        // toggle, setup wizard). Other tabs must never silently flip it.
+        if (isset($_POST['status'])) {
+            $opts['status'] = $_POST['status'] === 'on' ? 'on' : 'off';
+        }
 
         $new_pwd = isset($_POST['siren_password']) ? sanitize_text_field(wp_unslash($_POST['siren_password'])) : '';
         if ($new_pwd !== '') {
@@ -1029,7 +1553,16 @@ class SCBR_Security_Control_Master {
             $opts['needs_master_admin'] = 0;
             update_option($this->opt_key, $opts);
         }
-        wp_safe_redirect(admin_url('index.php'));
+        // Optional same-admin return URL (used by the setup wizard).
+        // Restricted to admin URLs only; defaults to the dashboard.
+        $redirect = admin_url('index.php');
+        if (!empty($_POST['scbr_return'])) {
+            $candidate = esc_url_raw(wp_unslash($_POST['scbr_return']));
+            if (is_string($candidate) && strpos($candidate, admin_url()) === 0) {
+                $redirect = $candidate;
+            }
+        }
+        wp_safe_redirect($redirect);
         exit;
     }
 

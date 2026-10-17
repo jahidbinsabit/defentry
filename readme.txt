@@ -4,7 +4,7 @@ Donate link: https://jbsabit.com/
 Tags: login protection, security, login alerts, device verification, brute force
 Requires at least: 5.5
 Tested up to: 7.1
-Stable tag: 1.2.3
+Stable tag: 2.0.5
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -121,6 +121,31 @@ Yes — 100% free, GPL-licensed, no premium version, no upsells, no locked featu
 2. Master control panel — trusted device management, blocked users and one-click device reset.
 
 == Changelog ==
+
+= 2.0.5 =
+* Code quality: documented `phpcs:ignore` justifications for the five `WordPress.Security.NonceVerification.Recommended` warnings — all are false positives (display-only `$_GET` reads; every state-changing handler verifies its nonce). No behavior change.
+
+= 2.0.4 =
+* Redesigned Verification, Devices, Protection, and Master Admin tabs to match the Overview tab: feature toggles instead of checkboxes, device cards per admin, danger-zone reset, blocked-user rows, IP-limit stat tiles, and a Master Admin highlight card.
+* FIXED: saving from the Verification or Master Admin tab silently turned protection OFF (status is now only updated by forms that manage it).
+* Master-Admin-exclusive control plane: secondary admins no longer see the Defentry menu or dashboard widget once setup is complete. Device verification, alert banners, and the siren still protect every admin account.
+* The verification overlay dialog now has its own siren sound toggle, reachable even while the overlay covers the admin notices.
+
+= 2.0.3 =
+* FIXED: broadcast siren could stay silent on other admins' browsers — the realtime poller now retries audio playback on user interaction (browser autoplay policy), and the "Mute Siren" button is now a toggle: muted users see "Unmute Siren" to re-enable the alert sound.
+
+= 2.0.2 =
+* FIXED: settings page showed the old unstyled UI when protection was OFF (v2 stylesheet now loads on the settings page and dashboard regardless of status).
+* NEW: realtime broadcast poller — other logged-in admins now see and hear the new-device alert within ~25 seconds without reloading the page; the banner auto-clears when the alert ends.
+* Warning banner now blinks with a red alarm glow to catch the eye.
+* NEW: "Block IP" button on the alert banner (Master Admin) instantly blocks the new device's IP for 1 hour; "Block User" now also instantly blocks the alert IP.
+* Banner action buttons (trust/block/mute) now work on every admin page, not just the settings page.
+
+= 2.0.1 =
+* Red alarm blink animation on the verification overlay backdrop (respects prefers-reduced-motion).
+
+= 2.0 =
+* Complete UI/UX overhaul: tabbed Master Control Panel (Overview, Verification, Devices, Protection, Master Admin) with a status card, protection toggle, and live stat tiles; 3-step first-run setup wizard; redesigned new-device verification overlay (modern card, shield emblem, smooth entrance animation, fully responsive, reduced-motion aware); new "Defentry Security" dashboard widget; polished real-time alert banner. No security-logic changes — all protection behavior is identical to 1.2.x.
 
 = 1.2.3 =
 * Directory assets finalized: real screenshots from a live site, animated siren icon and cinematic banner.

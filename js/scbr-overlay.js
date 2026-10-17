@@ -70,4 +70,40 @@
             submitPassword(passInput.value);
         }
     });
+
+    // Siren sound toggle inside the dialog: reachable even while the overlay
+    // covers the admin notices (where the banner mute button lives).
+    var soundToggle = document.getElementById('scbr-sound-toggle');
+    if (soundToggle) {
+        var isMuted = soundToggle.getAttribute('data-muted') === '1';
+        var labelOn = soundToggle.getAttribute('data-label-on') || 'Turn siren sound on';
+        var labelOff = soundToggle.getAttribute('data-label-off') || 'Turn siren sound off';
+        soundToggle.addEventListener('click', function() {
+            var action = isMuted ? 'scbr_unmute_siren' : 'scbr_mute_siren';
+            var form = new FormData();
+            form.append('action', action);
+            form.append('nonce', nonce);
+            fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: form })
+                .then(function(res) { return res.json(); })
+                .then(function(json) {
+                    if (json && json.success) {
+                        isMuted = !isMuted;
+                        soundToggle.setAttribute('data-muted', isMuted ? '1' : '0');
+                        soundToggle.textContent = isMuted ? labelOn : labelOff;
+                        // Immediately reflect on the siren playing right now.
+                        if (audio) {
+                            if (isMuted) {
+                                try { audio.pause(); } catch (e) {}
+                            } else {
+                                try {
+                                    var p = audio.play();
+                                    if (p && p.catch) p.catch(function() {});
+                                } catch (e) {}
+                            }
+                        }
+                    }
+                })
+                .catch(function(err) { if (window.console) console.error(err); });
+        });
+    }
 })();
