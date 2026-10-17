@@ -1,0 +1,70 @@
+#scbr-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 120000;
+}
+.scbr-overlay-bg {
+    position: absolute;
+    inset: 0;
+    background: rgba(180, 0, 0, 0.92);
+}
+.scbr-dialog {
+    position: relative;
+    max-width: 560px;
+    max-height: 84vh;
+    overflow-y: auto;
+    margin: 8vh auto;
+    background: #111;
+    color: #fff;
+    border-radius: 14px;
+    padding: 26px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    border: 3px solid #ff4d4f;
+}
+#scbr-title {
+    margin: 0 0 8px;
+    font-size: 22px;
+}
+#scbr-overlay p {
+    margin: 0 0 16px;
+    font-size: 13px;
+    opacity: 0.95;
+}
+.scbr-input-group {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+#scbr-pass {
+    flex: 1;
+    min-width: 220px;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #333;
+    background: #000;
+    color: #fff;
+}
+#scbr-submit {
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: none;
+    cursor: pointer;
+}
+#scbr-feedback {
+    margin-top: 10px;
+    color: #ffd966;
+}
+.scbr-broadcast-notice {
+    border-left-color: #ff4d4f;
+}
+/* A gently pulsing border draws attention without the accessibility
+   problems of a hard blink. Disabled entirely for reduced-motion users. */
+@keyframes scbr_pulse {
+    50% { border-left-color: #ff8a8a; }
+}
+@media (prefers-reduced-motion: no-preference) {
+    .scbr-broadcast-notice {
+        animation: scbr_pulse 2.5s ease-in-out infinite;
+    }
+}
