@@ -117,8 +117,11 @@ Yes — 100% free, GPL-licensed, no premium version, no upsells, no locked featu
 
 == Screenshots ==
 
-1. New-device verification overlay with the real-time alert banner — what appears the moment an unrecognized device opens wp-admin.
-2. Master control panel — trusted device management, blocked users and one-click device reset.
+1. Master control panel (Overview) — protection status, trusted-device counts and security stats at a glance.
+2. Verification settings — feature toggle switches, siren stop-password and custom siren audio controls.
+3. Trusted device management — per-admin device lists with one-click remove and danger-zone reset.
+4. New-device verification overlay — the full-screen stop-password prompt with siren that blocks unrecognized devices.
+5. Protection tab — blocked-user rows, IP attempt-limit stat tiles and one-click IP blocking.
 
 == Changelog ==
 
